@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /Users/vesa/Projects/project-tracker/project-tracker day --save "$@"

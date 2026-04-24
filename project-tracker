@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+"""
+project-tracker — Daily/weekly work journal from git, GitHub, Claude, and docs.
+
+Usage:
+  project-tracker [day [YYYY-MM-DD]] [--save] [--no-claude] [--project NAME]
+  project-tracker week [--save]
+  project-tracker setup     # install LaunchAgent (daily at 18:00, weekly Friday)
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+CONFIG_FILE = Path.home() / ".config" / "project-tracker" / "config.toml"
+
+def _load_config() -> dict:
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "rb") as f:
+            return tomllib.load(f)
+    return {}
+
+_cfg = _load_config()
+
+def _path(section: str, key: str, default: str) -> Path:
+    return Path(_cfg.get(section, {}).get(key, default)).expanduser()
+
+def _int(section: str, key: str, default: int) -> int:
+    return int(_cfg.get(section, {}).get(key, default))
+
+def _list(section: str, key: str, default: list) -> list:
+    return _cfg.get(section, {}).get(key, default)
+
+PROJECTS_DIR  = _path("paths", "projects_dir",  "~/Projects")
+DOCUMENTS_DIR = _path("paths", "documents_dir", "~/Documents")
+CLAUDE_DIR    = _path("paths", "claude_dir",    "~/.claude/projects")
+OUTPUT_DIR    = _path("paths", "output_dir",    "~/Documents/ProjectTracking")
+
+SESSION_GAP_H      = _int("estimation", "session_gap_hours",          2)
+SESSION_BASE_MIN   = _int("estimation", "session_base_minutes",       30)
+SESSION_PER_COMMIT = _int("estimation", "session_per_commit_minutes", 15)
+SESSION_CLAUDE_MIN = _int("estimation", "session_claude_minutes",     30)
+SESSION_DOC_MIN    = _int("estimation", "session_doc_minutes",        60)
+
+# Commit prefixes to ignore in grouping (merge commits etc.)
+MERGE_RE = re.compile(r"^Merge (pull request|branch)", re.IGNORECASE)
+
+# ─── Data classes ─────────────────────────────────────────────────────────────
+
+@dataclass
+class Commit:
+    sha: str
+    ts: datetime
+    author: str
+    subject: str
+    insertions: int = 0
+    deletions: int = 0
+
+@dataclass
+class PR:
+    number: int
+    title: str
+    merged_at: Optional[datetime]
+    url: str
+
+@dataclass
+class CIRun:
+    name: str
+    workflow: str
+    conclusion: str   # success | failure | cancelled | ""
+    status: str       # completed | in_progress | …
+    branch: str
+    created_at: Optional[datetime]
+
+@dataclass
+class Release:
+    tag: str
+    name: str
+    published_at: datetime
+
+@dataclass
+class ClaudeSession:
+    session_id: str
+    started_at: datetime
+    tasks: list[str] = field(default_factory=list)    # first user messages
+    conv_todos: list[str] = field(default_factory=list)
+
+@dataclass
+class TodoItem:
+    path: str
+    line: int
+    text: str
+    kind: str = "TODO"
+
+@dataclass
+class ProjectDay:
+    project: Path
+    day: date
+    commits: list[Commit]            = field(default_factory=list)
+    prs: list[PR]                    = field(default_factory=list)
+    ci_runs: list[CIRun]             = field(default_factory=list)
+    releases: list[Release]          = field(default_factory=list)
+    claude_sessions: list[ClaudeSession] = field(default_factory=list)
+    todos: list[TodoItem]            = field(default_factory=list)
+    meeting_notes: list[Path]        = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return self.project.name
+
+    @property
+    def has_activity(self) -> bool:
+        return bool(self.commits or self.prs or self.claude_sessions
+                    or self.ci_runs or self.releases or self.meeting_notes)
+
+    @property
+    def estimated_hours(self) -> float:
+        if self.commits:
+            times = sorted(c.ts for c in self.commits)
+            sessions, cur = [], [times[0]]
+            for t in times[1:]:
+                if (t - cur[-1]).total_seconds() > SESSION_GAP_H * 3600:
+                    sessions.append(cur); cur = [t]
+                else:
+                    cur.append(t)
+            sessions.append(cur)
+            total = sum(SESSION_BASE_MIN + len(s) * SESSION_PER_COMMIT for s in sessions)
+            return round(total / 60, 1)
+        # No commits: sum Claude sessions and meeting documents independently
+        total_min  = len(self.claude_sessions) * SESSION_CLAUDE_MIN
+        total_min += len(self.meeting_notes)   * SESSION_DOC_MIN
+        return round(total_min / 60, 1)
+
+# ─── Git ──────────────────────────────────────────────────────────────────────
+
+def git_projects() -> list[Path]:
+    if not PROJECTS_DIR.exists():
+        return []
+    return sorted(
+        d for d in PROJECTS_DIR.iterdir()
+        if d.is_dir() and (d / ".git").exists()
+    )
+
+def _run(cmd: list[str], cwd: Path, timeout: int = 15) -> str:
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+def commits_for_day(proj: Path, day: date) -> list[Commit]:
+    since = f"{day}T00:00:00"
+    until = f"{day}T23:59:59"
+    # --numstat after separator gives per-file stats in same output
+    raw = _run(
+        ["git", "log",
+         f"--since={since}", f"--until={until}",
+         "--pretty=format:COMMIT %H|%ai|%an|%s",
+         "--numstat", "--no-merges"],
+        proj
+    )
+    commits: list[Commit] = []
+    current: Optional[Commit] = None
+    for line in raw.splitlines():
+        if line.startswith("COMMIT "):
+            parts = line[7:].split("|", 3)
+            if len(parts) < 4:
+                continue
+            sha, ts_str, author, subject = parts
+            try:
+                ts = datetime.fromisoformat(ts_str)
+            except ValueError:
+                continue
+            if MERGE_RE.match(subject):
+                current = None
+                continue
+            current = Commit(sha=sha, ts=ts, author=author, subject=subject)
+            commits.append(current)
+        elif current and line and line[0].isdigit():
+            cols = line.split("\t")
+            if len(cols) >= 2:
+                try:
+                    current.insertions += int(cols[0])
+                    current.deletions  += int(cols[1])
+                except ValueError:
+                    pass
+    return commits
+
+# ─── GitHub ───────────────────────────────────────────────────────────────────
+
+def _has_github(proj: Path) -> bool:
+    return "github.com" in _run(["git", "remote", "-v"], proj)
+
+def _gh(args: list[str], proj: Path) -> list[dict]:
+    raw = _run(["gh"] + args, proj, timeout=20)
+    if not raw.strip():
+        return []
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+def _parse_gh_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def prs_for_day(proj: Path, day: date) -> list[PR]:
+    if not _has_github(proj):
+        return []
+    next_day = day + timedelta(days=1)
+    data = _gh(
+        ["pr", "list", "--state", "merged",
+         "--json", "number,title,mergedAt,url",
+         "--search", f"merged:{day}..{next_day}",
+         "--limit", "20"],
+        proj
+    )
+    out = []
+    for pr in data:
+        merged_at = _parse_gh_dt(pr.get("mergedAt"))
+        if merged_at and merged_at.date() != day:
+            continue
+        out.append(PR(number=pr["number"], title=pr["title"],
+                      merged_at=merged_at, url=pr.get("url", "")))
+    return out
+
+def ci_runs_for_day(proj: Path, day: date) -> list[CIRun]:
+    if not _has_github(proj):
+        return []
+    data = _gh(
+        ["run", "list",
+         "--created", str(day),
+         "--json", "databaseId,displayTitle,workflowName,status,conclusion,createdAt,headBranch",
+         "--limit", "30"],
+        proj
+    )
+    out = []
+    for r in data:
+        created_at = _parse_gh_dt(r.get("createdAt"))
+        if created_at and created_at.date() != day:
+            continue
+        out.append(CIRun(
+            name=r.get("displayTitle", ""),
+            workflow=r.get("workflowName", ""),
+            conclusion=r.get("conclusion", "") or "",
+            status=r.get("status", "") or "",
+            branch=r.get("headBranch", ""),
+            created_at=created_at,
+        ))
+    return out
+
+def releases_for_day(proj: Path, day: date) -> list[Release]:
+    if not _has_github(proj):
+        return []
+    data = _gh(
+        ["release", "list",
+         "--json", "tagName,name,publishedAt,isDraft,isPrerelease",
+         "--limit", "20"],
+        proj
+    )
+    out = []
+    for r in data:
+        if r.get("isDraft"):
+            continue
+        pub = _parse_gh_dt(r.get("publishedAt"))
+        if pub and pub.date() == day:
+            out.append(Release(tag=r["tagName"],
+                               name=r.get("name") or r["tagName"],
+                               published_at=pub))
+    return out
+
+# ─── Claude conversations ─────────────────────────────────────────────────────
+
+def _claude_project_dir(proj: Path) -> Optional[Path]:
+    # /Users/my-user/Projects/foo  →  -Users-my-user-Projects-foo
+    key = str(proj.absolute()).replace("/", "-")
+    candidate = CLAUDE_DIR / key
+    return candidate if candidate.is_dir() else None
+
+def _extract_messages(jsonl: Path) -> tuple[Optional[datetime], list[str], list[str]]:
+    """Return (first_ts, task_messages, todo_lines) from a session JSONL."""
+    first_ts = None
+    tasks: list[str] = []
+    conv_todos: list[str] = []
+    try:
+        with open(jsonl, errors="ignore") as f:
+            for raw_line in f:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                try:
+                    obj = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+                # Capture first timestamp we see
+                if first_ts is None:
+                    ts_str = obj.get("timestamp")
+                    if ts_str:
+                        try:
+                            first_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        except ValueError:
+                            pass
+                if obj.get("type") != "user":
+                    continue
+                msg = obj.get("message", obj)
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            content = c.get("text", "")
+                            break
+                if not isinstance(content, str):
+                    continue
+                content = content.strip()
+                # Skip slash commands and system tags
+                if not content or content.startswith("<") or re.match(r"^/\w", content):
+                    continue
+                if len(content) > 20:
+                    tasks.append(content[:300])
+                # Pick up TODO lines
+                for ln in content.splitlines():
+                    if re.search(r"\bTODO\b|\bFIXME\b|\- \[ \]", ln, re.IGNORECASE):
+                        stripped = ln.strip()
+                        if stripped:
+                            conv_todos.append(stripped[:120])
+    except OSError:
+        pass
+    return first_ts, tasks, conv_todos
+
+def claude_sessions_for_day(proj: Path, day: date) -> list[ClaudeSession]:
+    claude_dir = _claude_project_dir(proj)
+    if not claude_dir:
+        return []
+    sessions = []
+    for jsonl in claude_dir.glob("*.jsonl"):
+        try:
+            stat = jsonl.stat()
+            birthtime = datetime.fromtimestamp(stat.st_birthtime)
+        except AttributeError:
+            birthtime = datetime.fromtimestamp(stat.st_mtime)
+        if birthtime.date() != day:
+            continue
+        first_ts, tasks, conv_todos = _extract_messages(jsonl)
+        started = first_ts or birthtime
+        sessions.append(ClaudeSession(
+            session_id=jsonl.stem,
+            started_at=started,
+            tasks=tasks[:4],
+            conv_todos=conv_todos[:5],
+        ))
+    return sessions
+
+# ─── TODOs (code) ─────────────────────────────────────────────────────────────
+
+_CODE_EXTS = _list("scanning", "code_extensions",
+                   ["*.cs", "*.ts", "*.tsx", "*.js", "*.py", "*.go", "*.fs", "*.rs"])
+_TODO_RE   = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b", re.IGNORECASE)
+
+def code_todos(proj: Path) -> list[TodoItem]:
+    include = []
+    for ext in _CODE_EXTS:
+        include += ["--include", ext]
+    raw = _run(
+        ["grep", "-rn"] + include + ["--", r"TODO\|FIXME\|HACK\|XXX", str(proj)],
+        proj
+    )
+    if not raw:
+        # grep on macOS uses -E differently; try ripgrep if available
+        raw = _run(
+            ["grep", "-rn", "-E", r"TODO|FIXME|HACK|XXX",
+             "--include=*.cs", "--include=*.ts", "--include=*.tsx",
+             "--include=*.js", "--include=*.py", "."],
+            proj
+        )
+    items = []
+    for line in raw.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        fpath, lineno, text = parts
+        if ".git" in fpath or "node_modules" in fpath or "obj/" in fpath or "bin/" in fpath:
+            continue
+        kind = "TODO"
+        m = _TODO_RE.search(text)
+        if m:
+            kind = m.group(1).upper()
+        rel = fpath.replace(str(proj) + "/", "").replace(str(proj) + os.sep, "")
+        try:
+            ln = int(lineno)
+        except ValueError:
+            ln = 0
+        items.append(TodoItem(path=rel, line=ln, text=text.strip(), kind=kind))
+    return items[:30]
+
+# ─── Documents / meeting notes ────────────────────────────────────────────────
+
+_WORDS_TO_DROP = set(_list("scanning", "docs_noise_words", [
+    "api", "app", "platform", "tool", "system", "service",
+    "backend", "frontend", "client", "server", "web", "net",
+    "new", "next", "gen", "pro", "plus",
+]))
+
+def _doc_score(proj_name: str, dir_name: str) -> int:
+    norm = lambda s: set(re.split(r"[-_ ]", s.lower())) - _WORDS_TO_DROP
+    pw, dw = norm(proj_name), norm(dir_name)
+    return len(pw & dw)
+
+def _find_docs_dir(proj: Path) -> Optional[Path]:
+    if not DOCUMENTS_DIR.exists():
+        return None
+    best, best_score = None, 0
+    for d in DOCUMENTS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        score = _doc_score(proj.name, d.name)
+        if score > best_score:
+            best_score, best = score, d
+    return best if best_score > 0 else None
+
+def _read_doc(p: Path) -> str:
+    if p.suffix.lower() == ".docx":
+        r = subprocess.run(
+            ["textutil", "-stdout", "-convert", "txt", str(p)],
+            capture_output=True, text=True, timeout=10
+        )
+        return r.stdout
+    try:
+        return p.read_text(errors="ignore")
+    except OSError:
+        return ""
+
+def meeting_notes_for_day(proj: Path, day: date) -> list[Path]:
+    docs_dir = _find_docs_dir(proj)
+    if not docs_dir:
+        return []
+    lo = datetime.combine(day, datetime.min.time()).timestamp()
+    hi = datetime.combine(day, datetime.max.time()).timestamp()
+    found = []
+    for f in docs_dir.rglob("*"):
+        if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+            continue
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if lo <= mtime <= hi:
+            found.append(f)
+    return found
+
+# ─── Claude summarization ─────────────────────────────────────────────────────
+
+def _claude_available() -> bool:
+    return subprocess.run(["which", "claude"],
+                          capture_output=True).returncode == 0
+
+def summarize(text: str, prompt: str = "Summarize in 2-3 concise bullet points:") -> str:
+    if not text.strip():
+        return ""
+    try:
+        r = subprocess.run(
+            ["claude", "-p", f"{prompt}\n\n{text[:4000]}"],
+            capture_output=True, text=True, timeout=180
+        )
+        if r.returncode != 0:
+            print(f"claude exited {r.returncode}: {r.stderr.strip()[:200]}", file=sys.stderr)
+            return ""
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        print("claude summarization timed out after 180 s", file=sys.stderr)
+        return ""
+    except FileNotFoundError:
+        print("claude CLI not found — skipping summaries", file=sys.stderr)
+        return ""
+
+_DOC_SUMMARY_PROMPT = """\
+Analyze the document below and respond in Markdown using exactly these sections.
+Omit a section only if it genuinely has no content (e.g. no attendees mentioned, no action points).
+
+## Summary
+One sentence: what this document is about.
+**Attendees:** comma-separated names (omit line if none found)
+**Keywords:** 3-5 key topics, technologies, or proper nouns discussed
+
+## Key Points
+3-5 bullet points covering the most important information.
+
+## Action Points
+Bullet list of concrete tasks or decisions that require follow-up.
+Write "None" if there are no action points.
+
+## Suggested Next Steps
+0-3 specific, actionable suggestions for what I should do next based on this document.
+Examples of good suggestions: "Contact Matti regarding Azure DNS setup", "Implement customer filtering on the search form".
+Omit this section entirely if there is nothing actionable.
+
+Document:
+"""
+
+def summarize_document(text: str) -> str:
+    return summarize(text, _DOC_SUMMARY_PROMPT)
+
+# ─── Collection ───────────────────────────────────────────────────────────────
+
+def collect(proj: Path, day: date, use_gh: bool = True) -> ProjectDay:
+    pd = ProjectDay(project=proj, day=day)
+    pd.commits = commits_for_day(proj, day)
+
+    if use_gh:
+        pd.prs       = prs_for_day(proj, day)
+        pd.ci_runs   = ci_runs_for_day(proj, day)
+        pd.releases  = releases_for_day(proj, day)
+
+    pd.claude_sessions = claude_sessions_for_day(proj, day)
+    pd.meeting_notes   = meeting_notes_for_day(proj, day)
+
+    # Only grep TODOs if the project was active today (includes document updates)
+    if pd.has_activity:
+        pd.todos = code_todos(proj)
+
+    return pd
+
+def collect_standalone_docs(day: date, claimed_dirs: set[Path]) -> list[ProjectDay]:
+    """Return doc-only ProjectDay entries for ~/Documents/ folders that had file
+    activity on *day* but were not already matched to a git project."""
+    if not DOCUMENTS_DIR.exists():
+        return []
+    lo = datetime.combine(day, datetime.min.time()).timestamp()
+    hi = datetime.combine(day, datetime.max.time()).timestamp()
+    results = []
+    for d in DOCUMENTS_DIR.iterdir():
+        if not d.is_dir() or d in claimed_dirs:
+            continue
+        found = []
+        for f in d.rglob("*"):
+            if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+                continue
+            try:
+                if lo <= f.stat().st_mtime <= hi:
+                    found.append(f)
+            except OSError:
+                continue
+        if found:
+            pd = ProjectDay(project=d, day=day)
+            pd.meeting_notes = found
+            results.append(pd)
+    return results
+
+
+def collect_all(day: date, use_gh: bool = True,
+                project_filter: Optional[str] = None) -> list[ProjectDay]:
+    projects = git_projects()
+    if project_filter:
+        pf = project_filter.lower()
+        projects = [p for p in projects if pf in p.name.lower()]
+
+    results: list[ProjectDay] = []
+    # Collect git projects in parallel — each is independent
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(collect, p, day, use_gh): p for p in projects}
+        for fut in as_completed(futures):
+            try:
+                results.append(fut.result())
+            except Exception:
+                pass
+
+    # Also surface ~/Documents/ customer folders that had file activity today
+    # but don't correspond to any git project (e.g. Abc Oy, Xyz Ltd., etc.)
+    claimed = {_find_docs_dir(pd.project) for pd in results} - {None}
+    standalone = collect_standalone_docs(day, claimed)
+    if project_filter:
+        pf = project_filter.lower()
+        standalone = [pd for pd in standalone if pf in pd.name.lower()]
+    results += standalone
+
+    return sorted(results, key=lambda d: d.name)
+
+# ─── Formatting ───────────────────────────────────────────────────────────────
+
+_PREFIX_RE = re.compile(r"^(\w+)(?:\([^)]+\))?:\s*")
+
+def _group_commits(commits: list[Commit]) -> str:
+    groups: dict[str, list[Commit]] = defaultdict(list)
+    for c in commits:
+        m = _PREFIX_RE.match(c.subject)
+        groups[m.group(1) if m else "other"].append(c)
+    lines = []
+    for prefix in ["feat", "fix", "refactor", "chore", "docs", "test", "other"]:
+        if prefix not in groups:
+            continue
+        cs = groups[prefix]
+        subjects = [c.subject for c in cs[:3]]
+        extra = f", …+{len(cs)-3}" if len(cs) > 3 else ""
+        lines.append(f"- **{prefix}({len(cs)})**: {', '.join(subjects)}{extra}")
+    return "\n".join(lines)
+
+_CI_ICON = {"success": "✓", "failure": "✗", "cancelled": "⊘", "skipped": "–"}
+
+def _format_day_section(pd: ProjectDay, use_claude: bool) -> list[str]:
+    lines: list[str] = []
+    lines.append(f"## {pd.name}  [~{pd.estimated_hours:.1f}h estimated]\n")
+
+    # Commits
+    if pd.commits:
+        ins = sum(c.insertions for c in pd.commits)
+        dels = sum(c.deletions for c in pd.commits)
+        lines.append(f"### Commits ({len(pd.commits)})  +{ins}/−{dels} lines")
+        lines.append(_group_commits(pd.commits))
+        lines.append("")
+
+    # PRs
+    if pd.prs:
+        lines.append("### PRs merged")
+        for pr in pd.prs:
+            lines.append(f"- #{pr.number}: {pr.title}")
+            lines.append(f"  {pr.url}")
+        lines.append("")
+
+    # CI / Deployments
+    if pd.ci_runs:
+        # Deduplicate by workflow name, keeping latest
+        seen_workflows: dict[str, CIRun] = {}
+        for r in pd.ci_runs:
+            key = r.workflow or r.name
+            if key not in seen_workflows:
+                seen_workflows[key] = r
+        lines.append("### CI / Deployments")
+        for r in seen_workflows.values():
+            icon = _CI_ICON.get(r.conclusion, "·")
+            label = r.workflow or r.name
+            time_str = ""
+            if r.created_at:
+                local = r.created_at.astimezone()
+                time_str = f" at {local.strftime('%H:%M')}"
+            lines.append(f"- {icon} {label} ({r.branch}){time_str} — {r.conclusion or r.status}")
+        lines.append("")
+
+    # Releases
+    if pd.releases:
+        lines.append("### Releases")
+        for rel in pd.releases:
+            lines.append(f"- **{rel.tag}**: {rel.name}")
+        lines.append("")
+
+    # Claude sessions
+    if pd.claude_sessions:
+        lines.append(f"### Claude sessions ({len(pd.claude_sessions)})")
+        for s in pd.claude_sessions:
+            for task in s.tasks[:2]:
+                short = task.splitlines()[0][:120]
+                lines.append(f"- {short}")
+        lines.append("")
+
+    # TODOs (code + conversation)
+    code_td  = pd.todos
+    conv_tds = [t for s in pd.claude_sessions for t in s.conv_todos]
+    if code_td or conv_tds:
+        lines.append("### TODOs")
+        if code_td:
+            lines.append(f"**In code** ({len(code_td)} total, showing first 6):")
+            for t in code_td[:6]:
+                lines.append(f"- `{t.path}:{t.line}` {t.text[:100]}")
+        if conv_tds:
+            lines.append("**In conversations:**")
+            for t in conv_tds[:4]:
+                lines.append(f"- {t}")
+        lines.append("")
+
+    # Meeting notes
+    if pd.meeting_notes:
+        lines.append("### Meeting notes")
+        for note in pd.meeting_notes:
+            lines.append(f"#### {note.name}")
+            if use_claude:
+                content = _read_doc(note)
+                summary = summarize_document(content)
+                if summary:
+                    # Indent the structured markdown under the filename heading
+                    for summary_line in summary.splitlines():
+                        lines.append(f"  {summary_line}")
+                else:
+                    lines.append(f"  _(could not summarize — {note})_")
+            else:
+                lines.append(f"  `{note}`")
+        lines.append("")
+
+    return lines
+
+def format_day(day: date, all_data: list[ProjectDay], use_claude: bool = True) -> str:
+    active = [d for d in all_data if d.has_activity]
+    header = [f"# {day.strftime('%A, %Y-%m-%d')}\n"]
+
+    if not active:
+        return "".join(header) + "_No activity recorded._\n"
+
+    total_h = sum(d.estimated_hours for d in active)
+    proj_names = ", ".join(d.name for d in active)
+    header.append(f"**Estimated time**: ~{total_h:.1f}h — {proj_names}\n")
+
+    lines = list(header)
+    for pd in active:
+        lines += _format_day_section(pd, use_claude)
+
+    return "\n".join(lines)
+
+def format_week(week_start: date, days_data: dict[date, list[ProjectDay]]) -> str:
+    workdays = [week_start + timedelta(days=i) for i in range(5)]
+    friday   = workdays[-1]
+    lines = [f"# Week {week_start.strftime('W%W')} — {week_start} → {friday}\n"]
+
+    # Per-project totals
+    proj_totals: dict[str, dict] = defaultdict(lambda: {
+        "hours": 0.0, "commits": 0, "prs": 0, "ci_runs": 0, "releases": 0
+    })
+    for day in workdays:
+        for pd in days_data.get(day, []):
+            if not pd.has_activity:
+                continue
+            pt = proj_totals[pd.name]
+            pt["hours"]    += pd.estimated_hours
+            pt["commits"]  += len(pd.commits)
+            pt["prs"]      += len(pd.prs)
+            pt["ci_runs"]  += len(pd.ci_runs)
+            pt["releases"] += len(pd.releases)
+
+    if not proj_totals:
+        lines.append("_No activity this week._\n")
+        return "\n".join(lines)
+
+    total_h = sum(v["hours"] for v in proj_totals.values())
+    lines.append(f"**Total estimated time**: ~{total_h:.1f}h\n")
+    lines.append("## Projects\n")
+    for name, t in sorted(proj_totals.items(), key=lambda x: -x[1]["hours"]):
+        parts = [f"~{t['hours']:.1f}h", f"{t['commits']} commits"]
+        if t["prs"]:      parts.append(f"{t['prs']} PRs")
+        if t["ci_runs"]:  parts.append(f"{t['ci_runs']} CI runs")
+        if t["releases"]: parts.append(f"{t['releases']} releases")
+        lines.append(f"- **{name}**: {' · '.join(parts)}")
+    lines.append("")
+
+    # Day-by-day
+    lines.append("## Day-by-day\n")
+    for day in workdays:
+        day_data = days_data.get(day, [])
+        active = [d for d in day_data if d.has_activity]
+        label = day.strftime("%a %d")
+        if not active:
+            lines.append(f"### {label}: _no activity_\n")
+            continue
+        day_h = sum(d.estimated_hours for d in active)
+        proj_list = ", ".join(d.name for d in active)
+        lines.append(f"### {label}: ~{day_h:.1f}h — {proj_list}\n")
+        for pd in active:
+            header_parts = [f"**{pd.name}**"]
+            if pd.commits:
+                ins = sum(c.insertions for c in pd.commits)
+                dels = sum(c.deletions for c in pd.commits)
+                header_parts.append(f"{len(pd.commits)} commits, +{ins}/−{dels}")
+            if pd.claude_sessions:
+                header_parts.append(f"{len(pd.claude_sessions)} Claude session(s)")
+            lines.append(" — ".join(header_parts))
+            if pd.commits:
+                lines.append(_group_commits(pd.commits))
+            if pd.prs:
+                lines.append("PRs: " + ", ".join(f"#{p.number}" for p in pd.prs))
+            if pd.releases:
+                lines.append("Releases: " + ", ".join(r.tag for r in pd.releases))
+            if pd.claude_sessions and not pd.commits:
+                for s in pd.claude_sessions:
+                    if s.tasks:
+                        lines.append(f"  - {s.tasks[0].splitlines()[0][:100]}")
+            lines.append("")
+
+    return "\n".join(lines)
+
+# ─── LaunchAgent setup ────────────────────────────────────────────────────────
+
+LAUNCHAGENT_DIR   = Path.home() / "Library" / "LaunchAgents"
+SCRIPT_PATH       = Path(__file__).resolve()
+LOG_PATH          = Path.home() / ".config" / "project-tracker" / "tracker.log"
+
+DAILY_PLIST_ID    = "com.vesa.project-tracker.daily"
+WEEKLY_PLIST_ID   = "com.vesa.project-tracker.weekly"
+CATCHUP_PLIST_ID  = "com.vesa.project-tracker.catchup"
+
+def _plist(label: str, args: list[str], hour: int, minute: int,
+           weekday: Optional[int] = None, run_at_load: bool = False) -> str:
+    """Generate a LaunchAgent plist."""
+    cal_parts = (
+        f"        <key>Hour</key><integer>{hour}</integer>\n"
+        f"        <key>Minute</key><integer>{minute}</integer>"
+    )
+    if weekday is not None:
+        cal_parts += f"\n        <key>Weekday</key><integer>{weekday}</integer>"
+
+    prog_args = "\n".join(f"        <string>{a}</string>" for a in args)
+    run_at_load_val = "true" if run_at_load else "false"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{prog_args}
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+{cal_parts}
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{LOG_PATH}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_PATH}</string>
+    <key>RunAtLoad</key>
+    <{run_at_load_val}/>
+</dict>
+</plist>
+"""
+
+def cmd_catchup(_args: argparse.Namespace) -> None:
+    """Backfill any daily or weekly reports that were not saved yet."""
+    today = date.today()
+    generated: list[str] = []
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Daily reports: scan the last 14 calendar days, workdays only ──────────
+    for delta in range(1, 15):
+        day = today - timedelta(days=delta)
+        if day.weekday() >= 5:          # skip Saturday (5) and Sunday (6)
+            continue
+        out = OUTPUT_DIR / f"{day}.md"
+        if out.exists():
+            continue
+        print(f"Catch-up: missing daily report for {day}, generating…", file=sys.stderr)
+        data = collect_all(day, use_gh=True)
+        report = format_day(day, data, use_claude=True)
+        out.write_text(report)
+        generated.append(f"  daily  → {out}")
+
+    # ── Weekly reports: scan the last 4 completed weeks ───────────────────────
+    # "Completed" means the Friday of that week is strictly before today.
+    for week_delta in range(1, 5):
+        week_start = today - timedelta(days=today.weekday()) - timedelta(weeks=week_delta)
+        friday = week_start + timedelta(days=4)
+        if friday >= today:
+            continue                    # week not yet finished
+        week_file = OUTPUT_DIR / f"{week_start.strftime('%Y-W%W')}.md"
+        if week_file.exists():
+            continue
+        print(f"Catch-up: missing weekly report for week {week_start} – {friday}, generating…",
+              file=sys.stderr)
+        workdays = [week_start + timedelta(days=i) for i in range(5)]
+        days_data: dict[date, list[ProjectDay]] = {}
+        for day in workdays:
+            print(f"  Collecting {day}…", file=sys.stderr)
+            days_data[day] = collect_all(day, use_gh=True)
+        report = format_week(week_start, days_data)
+        week_file.write_text(report)
+        generated.append(f"  weekly → {week_file}")
+
+    if generated:
+        print(f"Catch-up: generated {len(generated)} report(s):", file=sys.stderr)
+        for line in generated:
+            print(line, file=sys.stderr)
+    else:
+        print("Catch-up: all reports are up to date.", file=sys.stderr)
+
+
+def _write_wrapper(name: str, args: list[str]) -> Path:
+    """Write a named shell wrapper in the same directory as the script.
+    macOS Login Items displays the wrapper filename rather than 'python3.14'."""
+    wrapper = SCRIPT_PATH.parent / name
+    wrapper.write_text(
+        f"#!/bin/sh\nexec {SCRIPT_PATH} {' '.join(args)} \"$@\"\n"
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def cmd_setup(_args: argparse.Namespace) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAUNCHAGENT_DIR.mkdir(parents=True, exist_ok=True)
+
+    daily_h  = _int("schedule", "daily_hour",    18)
+    daily_m  = _int("schedule", "daily_minute",   0)
+    weekly_h = _int("schedule", "weekly_hour",   17)
+    weekly_m = _int("schedule", "weekly_minute", 30)
+
+    # Named wrappers — macOS Login Items shows these names instead of 'python3.14'
+    w_daily   = _write_wrapper("project-tracker-daily",   ["day",   "--save"])
+    w_weekly  = _write_wrapper("project-tracker-weekly",  ["week",  "--save"])
+    w_catchup = _write_wrapper("project-tracker-catchup", ["catchup"])
+
+    # Daily — saves today's report
+    daily_plist = LAUNCHAGENT_DIR / f"{DAILY_PLIST_ID}.plist"
+    daily_plist.write_text(_plist(
+        DAILY_PLIST_ID,
+        [str(w_daily)],
+        hour=daily_h, minute=daily_m,
+    ))
+    subprocess.run(["launchctl", "unload", str(daily_plist)], capture_output=True)
+    subprocess.run(["launchctl", "load",   str(daily_plist)], capture_output=True)
+
+    # Weekly on Friday — saves the week summary
+    weekly_plist = LAUNCHAGENT_DIR / f"{WEEKLY_PLIST_ID}.plist"
+    weekly_plist.write_text(_plist(
+        WEEKLY_PLIST_ID,
+        [str(w_weekly)],
+        hour=weekly_h, minute=weekly_m, weekday=5,  # 5 = Friday in launchd
+    ))
+    subprocess.run(["launchctl", "unload", str(weekly_plist)], capture_output=True)
+    subprocess.run(["launchctl", "load",   str(weekly_plist)], capture_output=True)
+
+    # Catch-up — runs at 08:00 every day AND on every login (RunAtLoad)
+    catchup_plist = LAUNCHAGENT_DIR / f"{CATCHUP_PLIST_ID}.plist"
+    catchup_plist.write_text(_plist(
+        CATCHUP_PLIST_ID,
+        [str(w_catchup)],
+        hour=8, minute=0,
+        run_at_load=True,
+    ))
+    subprocess.run(["launchctl", "unload", str(catchup_plist)], capture_output=True)
+    subprocess.run(["launchctl", "load",   str(catchup_plist)], capture_output=True)
+
+    print(f"Installed LaunchAgents:")
+    print(f"  Daily   — weekdays {daily_h:02d}:{daily_m:02d}      → {OUTPUT_DIR}/YYYY-MM-DD.md")
+    print(f"  Weekly  — Fridays  {weekly_h:02d}:{weekly_m:02d}      → {OUTPUT_DIR}/YYYY-Www.md")
+    print(f"  Catch-up — daily 08:00 + on login  (backfills missed reports)")
+    print(f"  Log     → {LOG_PATH}")
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Project activity tracker — daily/weekly work journal from git, GitHub, Claude, and docs.",
+        epilog=(
+            f"With no subcommand, defaults to: project-tracker day (today).\n"
+            f"Reports saved to:  {OUTPUT_DIR}\n"
+            f"Config:            {CONFIG_FILE}\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    # day
+    p_day = sub.add_parser("day", help="Report for one day (default: today)")
+    p_day.add_argument("date", nargs="?", default=None,
+                       help="Date to report on, YYYY-MM-DD (default: today)")
+    p_day.add_argument("--save",      action="store_true",
+                       help=f"Write report to {OUTPUT_DIR}/YYYY-MM-DD.md")
+    p_day.add_argument("--no-claude", action="store_true",
+                       help="Skip Claude AI summaries for meeting notes (faster)")
+    p_day.add_argument("--no-gh",     action="store_true",
+                       help="Skip all GitHub API calls — PRs, CI runs, releases (fastest)")
+    p_day.add_argument("--project",   default=None, metavar="NAME",
+                       help="Show only projects whose name contains NAME (substring match)")
+
+    # week
+    p_week = sub.add_parser("week", help="Weekly summary (current Mon–Fri)")
+    p_week.add_argument("--save",      action="store_true",
+                        help=f"Write report to {OUTPUT_DIR}/YYYY-Www.md")
+    p_week.add_argument("--no-claude", action="store_true",
+                        help="Skip Claude AI summaries for meeting notes (faster)")
+    p_week.add_argument("--no-gh",     action="store_true",
+                        help="Skip all GitHub API calls — PRs, CI runs, releases (fastest)")
+    p_week.add_argument("--project",   default=None, metavar="NAME",
+                        help="Show only projects whose name contains NAME (substring match)")
+    p_week.add_argument("--last",      action="store_true",
+                        help="Report on last week instead of the current week")
+
+    # catchup
+    sub.add_parser("catchup",
+                   help="Backfill any daily/weekly reports missed while the Mac was asleep")
+
+    # setup
+    sub.add_parser("setup",
+                   help="Install (or reinstall) LaunchAgents for automatic daily/weekly scheduling")
+
+    args = parser.parse_args()
+
+    # Default: no subcommand → day report for today
+    if args.cmd is None:
+        args.cmd = "day"
+        args.date = None
+        args.save = False
+        args.no_claude = False
+        args.no_gh = False
+        args.project = None
+
+    if args.cmd == "catchup":
+        cmd_catchup(args)
+        return
+
+    if args.cmd == "setup":
+        cmd_setup(args)
+        return
+
+    if args.cmd == "day":
+        target = date.today()
+        if getattr(args, "date", None):
+            try:
+                target = date.fromisoformat(args.date)
+            except ValueError:
+                print(f"Invalid date: {args.date}  (expected YYYY-MM-DD)", file=sys.stderr)
+                sys.exit(1)
+
+        print(f"Collecting data for {target}…", file=sys.stderr)
+        all_data = collect_all(
+            target,
+            use_gh=not args.no_gh,
+            project_filter=args.project,
+        )
+        report = format_day(target, all_data, use_claude=not args.no_claude)
+        print(report)
+
+        if args.save:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            out = OUTPUT_DIR / f"{target}.md"
+            out.write_text(report)
+            print(f"\nSaved → {out}", file=sys.stderr)
+
+    elif args.cmd == "week":
+        today = date.today()
+        if getattr(args, "last", False):
+            week_start = today - timedelta(days=today.weekday() + 7)
+        else:
+            week_start = today - timedelta(days=today.weekday())
+
+        workdays = [week_start + timedelta(days=i) for i in range(5)
+                    if (week_start + timedelta(days=i)) <= today]
+
+        days_data: dict[date, list[ProjectDay]] = {}
+        for day in workdays:
+            print(f"Collecting {day}…", file=sys.stderr)
+            days_data[day] = collect_all(
+                day,
+                use_gh=not args.no_gh,
+                project_filter=args.project,
+            )
+
+        report = format_week(week_start, days_data)
+        print(report)
+
+        if args.save:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            out = OUTPUT_DIR / f"{week_start.strftime('%Y-W%W')}.md"
+            out.write_text(report)
+            print(f"\nSaved → {out}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
