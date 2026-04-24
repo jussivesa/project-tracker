@@ -3,10 +3,10 @@
 Automatic daily/weekly work journal. Collects activity from git history, GitHub PRs/CI/releases, Claude Code
 conversations, code TODOs, and meeting notes — then renders a Markdown report per day with a Friday weekly roll-up.
 
-**Script**: `~/Projects/project-tracker/project-tracker`
-**Config**: `~/.config/project-tracker/config.toml`
-**Reports**: `~/Documents/ProjectTracking/`
-**Log**: `~/.config/project-tracker/tracker.log`
+- **Script**: `~/Projects/project-tracker/project-tracker`
+- **Config**: `~/.config/project-tracker/config.toml`
+- **Reports**: `~/Documents/ProjectTracking/`
+- **Log**: `~/.config/project-tracker/tracker.log`
 
 ---
 
