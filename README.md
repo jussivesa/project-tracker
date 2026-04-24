@@ -286,13 +286,12 @@ Reports are written to `~/Documents/ProjectTracking/` when `--save` is passed or
 
 ## Dependencies
 
-| Tool | Required fo-----------------tes |
-|------------------ -|------------ -|-------|
-| Python 3.11+ | Running the script | Uses `tomllib` (stdlib since 3 .11); tested on 3.14 |
-| `git`          | Commit/LOC da ta | Must be on PATH |
-| `gh` (GitHub CLI) | PRs, CI runs, releases | Optional; skipped per-repo if no `github. com` remote, o r globally with
-`--no-gh` |
-| `claude` CLI | Meeting note summaries | Optional; skipped automatic ally if not found or `--no-claude` is passed |
-| `textutil`        | Reading `.docx` files | Built into macOS; no install needed |
+| Tool              | Required for           | Notes                                                                            |
+|-------------------|------------------------|----------------------------------------------------------------------------------|
+| Python 3.11+      | Running the script     | Uses `tomllib` (stdlib since 3.11); tested on 3.14                               |
+| `git`             | Commit/LOC data        | Must be on PATH                                                                  |
+| `gh` (GitHub CLI) | PRs, CI runs, releases | Optional; skipped per-repo if no `github.com` remote, or globally with `--no-gh` |
+| `claude` CLI      | Meeting note summaries | Optional; skipped automatically if not found or `--no-claude` is passed          |
+| `textutil`        | Reading `.docx` files  | Built into macOS; no install needed                                              |
 
 No third-party Python packages are required.
