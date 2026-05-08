@@ -515,6 +515,229 @@ Document:
 def summarize_document(text: str) -> str:
     return summarize(text, _DOC_SUMMARY_PROMPT)
 
+# ─── Ask ──────────────────────────────────────────────────────────────────────
+
+_ASK_MAX_COMMITS     = 50
+_ASK_MAX_PRS         = 20
+_ASK_MAX_SESSIONS    = 20
+_ASK_TIMEOUT_SECONDS = 300
+
+def _resolve_project(name: str) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve a name → (git_repo, docs_dir). Either may be None.
+
+    First substring-matches against ~/Projects/ git repos, falling back to a
+    standalone ~/Documents/ subfolder when no git repo matches."""
+    nl = name.lower()
+    for p in git_projects():
+        if nl in p.name.lower():
+            return p, _find_docs_dir(p)
+    if DOCUMENTS_DIR.exists():
+        for d in sorted(DOCUMENTS_DIR.iterdir()):
+            if d.is_dir() and nl in d.name.lower():
+                return None, d
+    return None, None
+
+def _recent_commits(proj: Path, days: int) -> list[Commit]:
+    since = (date.today() - timedelta(days=days)).isoformat()
+    raw = _run(
+        ["git", "log", f"--since={since}",
+         "--pretty=format:COMMIT %H|%ai|%an|%s",
+         "--no-merges"],
+        proj
+    )
+    commits: list[Commit] = []
+    for line in raw.splitlines():
+        if not line.startswith("COMMIT "):
+            continue
+        parts = line[7:].split("|", 3)
+        if len(parts) < 4:
+            continue
+        sha, ts_str, author, subject = parts
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except ValueError:
+            continue
+        if MERGE_RE.match(subject):
+            continue
+        commits.append(Commit(sha=sha, ts=ts, author=author, subject=subject))
+    return commits
+
+def _recent_docs(docs_dir: Path, days: int) -> list[Path]:
+    cutoff = (datetime.now() - timedelta(days=days)).timestamp()
+    found = []
+    for f in docs_dir.rglob("*"):
+        if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+            continue
+        try:
+            if f.stat().st_mtime >= cutoff:
+                found.append(f)
+        except OSError:
+            continue
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return found
+
+def _recent_prs(proj: Path, days: int) -> list[PR]:
+    if not _has_github(proj):
+        return []
+    since = (date.today() - timedelta(days=days)).isoformat()
+    data = _gh(
+        ["pr", "list", "--state", "merged",
+         "--json", "number,title,mergedAt,url",
+         "--search", f"merged:>={since}",
+         "--limit", "30"],
+        proj
+    )
+    out = []
+    for pr in data:
+        merged_at = _parse_gh_dt(pr.get("mergedAt"))
+        out.append(PR(number=pr["number"], title=pr["title"],
+                      merged_at=merged_at, url=pr.get("url", "")))
+    return sorted(out, key=lambda p: p.merged_at or datetime.min, reverse=True)
+
+def _recent_claude_sessions(proj: Path, days: int) -> list[ClaudeSession]:
+    claude_dir = _claude_project_dir(proj)
+    if not claude_dir:
+        return []
+    cutoff = (datetime.now() - timedelta(days=days)).timestamp()
+    sessions: list[ClaudeSession] = []
+    for jsonl in claude_dir.glob("*.jsonl"):
+        try:
+            stat = jsonl.stat()
+        except OSError:
+            continue
+        birthtime = getattr(stat, "st_birthtime", stat.st_mtime)
+        if birthtime < cutoff:
+            continue
+        first_ts, tasks, conv_todos = _extract_messages(jsonl)
+        started = first_ts or datetime.fromtimestamp(birthtime)
+        sessions.append(ClaudeSession(
+            session_id=jsonl.stem, started_at=started,
+            tasks=tasks[:4], conv_todos=conv_todos[:5],
+        ))
+    return sorted(sessions, key=lambda s: s.started_at, reverse=True)
+
+def _build_ask_context(label: str, git_proj: Optional[Path], docs_dir: Optional[Path],
+                       days: int, use_gh: bool, use_docs: bool) -> str:
+    parts = [f"# Project context: {label}", f"_Last {days} days_", ""]
+
+    if git_proj:
+        commits = _recent_commits(git_proj, days)
+        if commits:
+            parts.append(f"## Commits ({len(commits)})")
+            for c in commits[:_ASK_MAX_COMMITS]:
+                parts.append(f"- {c.ts.date()} `{c.sha[:7]}` {c.subject}")
+            parts.append("")
+
+        if use_gh:
+            prs = _recent_prs(git_proj, days)
+            if prs:
+                parts.append(f"## PRs merged ({len(prs)})")
+                for pr in prs[:_ASK_MAX_PRS]:
+                    d = pr.merged_at.date() if pr.merged_at else "?"
+                    parts.append(f"- {d} #{pr.number} {pr.title}")
+                parts.append("")
+
+        sessions = _recent_claude_sessions(git_proj, days)
+        if sessions:
+            parts.append(f"## Claude sessions ({len(sessions)})")
+            for s in sessions[:_ASK_MAX_SESSIONS]:
+                first = s.tasks[0].splitlines()[0][:200] if s.tasks else "(no task captured)"
+                parts.append(f"- {s.started_at.date()}: {first}")
+            parts.append("")
+
+    if docs_dir:
+        docs = _recent_docs(docs_dir, days)
+        if docs:
+            parts.append(f"## Documents ({len(docs)} modified)")
+            for f in docs:
+                try:
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime).date()
+                except OSError:
+                    mtime = "?"
+                rel = f.relative_to(docs_dir)
+                if use_docs:
+                    text = _read_doc(f).strip()
+                    parts.append(f"### {rel} (modified {mtime})")
+                    parts.append(text or "_(empty)_")
+                    parts.append("")
+                else:
+                    parts.append(f"- {rel} (modified {mtime})")
+            if not use_docs:
+                parts.append("")
+
+    return "\n".join(parts)
+
+def _ask_claude(prompt: str) -> str:
+    try:
+        r = subprocess.run(
+            ["claude", "-p", prompt],
+            capture_output=True, text=True, timeout=_ASK_TIMEOUT_SECONDS,
+        )
+        if r.returncode != 0:
+            print(f"claude exited {r.returncode}: {r.stderr.strip()[:200]}", file=sys.stderr)
+            return ""
+        return r.stdout.strip()
+    except subprocess.TimeoutExpired:
+        print(f"claude timed out after {_ASK_TIMEOUT_SECONDS}s", file=sys.stderr)
+        return ""
+    except FileNotFoundError:
+        print("claude CLI not found", file=sys.stderr)
+        return ""
+
+def cmd_ask(args: argparse.Namespace) -> None:
+    question = " ".join(args.question).strip()
+    if not question:
+        print("Empty question.", file=sys.stderr)
+        sys.exit(1)
+
+    git_proj, docs_dir = _resolve_project(args.project)
+    if not git_proj and not docs_dir:
+        print(f"No project or documents folder matching '{args.project}'", file=sys.stderr)
+        sys.exit(1)
+
+    label = (git_proj or docs_dir).name
+    sources = []
+    if git_proj:  sources.append(f"repo {git_proj}")
+    if docs_dir:  sources.append(f"docs {docs_dir}")
+    print(f"Gathering context for {label} (last {args.days} days) — {', '.join(sources)}…",
+          file=sys.stderr)
+
+    context = _build_ask_context(
+        label=label, git_proj=git_proj, docs_dir=docs_dir,
+        days=args.days, use_gh=not args.no_gh, use_docs=not args.no_docs,
+    )
+
+    if not _claude_available():
+        print("claude CLI not available — cannot answer.", file=sys.stderr)
+        sys.exit(1)
+
+    prompt = (
+        f"You are answering a question about the project '{label}'. "
+        "Use the context below to answer. If the context lacks enough "
+        "information, say so explicitly rather than guessing.\n\n"
+        f"# Question\n{question}\n\n"
+        f"# Context\n{context}"
+    )
+
+    print("Asking Claude…", file=sys.stderr)
+    answer = _ask_claude(prompt)
+    if not answer:
+        sys.exit(1)
+
+    print(f"# {label} — {question}\n")
+    print(answer)
+
+    if args.save:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out = OUTPUT_DIR / f"ask-{label}.md"
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        entry = f"\n---\n\n## {ts}\n\n**Q:** {question}\n\n{answer}\n"
+        if out.exists():
+            out.write_text(out.read_text() + entry)
+        else:
+            out.write_text(f"# Q&A history: {label}\n{entry}")
+        print(f"\nAppended → {out}", file=sys.stderr)
+
 # ─── Collection ───────────────────────────────────────────────────────────────
 
 def collect(proj: Path, day: date, use_gh: bool = True) -> ProjectDay:
@@ -798,6 +1021,11 @@ DAILY_PLIST_ID    = "com.vesa.project-tracker.daily"
 WEEKLY_PLIST_ID   = "com.vesa.project-tracker.weekly"
 CATCHUP_PLIST_ID  = "com.vesa.project-tracker.catchup"
 
+# LaunchAgents inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which
+# resolves `#!/usr/bin/env python3` to system 3.9 — too old for `tomllib`. Prepend
+# Homebrew so python3 (3.11+), gh, and claude are picked up at agent runtime.
+AGENT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 def _plist(label: str, args: list[str], hour: int, minute: int,
            weekday: Optional[int] = None, run_at_load: bool = False) -> str:
     """Generate a LaunchAgent plist."""
@@ -821,6 +1049,11 @@ def _plist(label: str, args: list[str], hour: int, minute: int,
     <array>
 {prog_args}
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{AGENT_PATH}</string>
+    </dict>
     <key>StartCalendarInterval</key>
     <dict>
 {cal_parts}
@@ -988,6 +1221,20 @@ def main() -> None:
     p_week.add_argument("--last",      action="store_true",
                         help="Report on last week instead of the current week")
 
+    # ask
+    p_ask = sub.add_parser("ask",
+                           help="Ask Claude a question about a project's recent activity")
+    p_ask.add_argument("project", help="Project name (substring match)")
+    p_ask.add_argument("question", nargs="+", help="The question to ask")
+    p_ask.add_argument("--days", type=int, default=30,
+                       help="How many days of history to include (default: 30)")
+    p_ask.add_argument("--no-gh", action="store_true",
+                       help="Skip GitHub PR lookup")
+    p_ask.add_argument("--no-docs", action="store_true",
+                       help="Skip embedding document contents (use file metadata only)")
+    p_ask.add_argument("--save", action="store_true",
+                       help=f"Append Q&A to {OUTPUT_DIR}/ask-<project>.md")
+
     # catchup
     sub.add_parser("catchup",
                    help="Backfill any daily/weekly reports missed while the Mac was asleep")
@@ -1006,6 +1253,10 @@ def main() -> None:
         args.no_claude = False
         args.no_gh = False
         args.project = None
+
+    if args.cmd == "ask":
+        cmd_ask(args)
+        return
 
     if args.cmd == "catchup":
         cmd_catchup(args)

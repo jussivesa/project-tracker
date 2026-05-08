@@ -27,6 +27,13 @@ project-tracker week --save              # write to ~/Documents/ProjectTracking/
 project-tracker week --no-claude         # skip Claude AI summaries
 project-tracker week --no-gh             # skip GitHub
 
+project-tracker ask <project> "<q>"      # ask Claude a question grounded in the project's recent activity
+project-tracker ask abc "what's open?"   # uses git history, PRs, Claude sessions, and meeting notes
+project-tracker ask abc "..." --days 7   # narrow context window (default 30)
+project-tracker ask abc "..." --save     # append Q&A to ~/Documents/ProjectTracking/ask-<project>.md
+project-tracker ask abc "..." --no-docs  # skip embedding document text (metadata only)
+project-tracker ask abc "..." --no-gh    # skip GitHub PR lookup
+
 project-tracker catchup                  # backfill any missed daily/weekly reports
 project-tracker setup                    # (re-)install LaunchAgents
 ```
@@ -69,6 +76,25 @@ Collects all five working days (Mon–Fri) and produces:
 
 - **Project totals**: estimated hours, commit count, PR count, CI runs, releases
 - **Day-by-day breakdown**: per-project commit groups, PR/release lines, and Claude session notes for each day
+
+### Ask
+
+`project-tracker ask <project> "<question>"` gathers recent activity for one project and feeds it to `claude -p`
+together with the question. Context bundle:
+
+| Source                | Limit (default)                                 |
+|-----------------------|-------------------------------------------------|
+| Git commits           | last 30 days, up to 50 entries                  |
+| Merged PRs (GitHub)   | last 30 days, up to 20 entries                  |
+| Claude sessions       | last 30 days, up to 20 first-tasks              |
+| Meeting notes / docs  | every file modified in the window, full content |
+
+Use `--days N` to widen/narrow the window. `--no-docs` keeps document filenames but drops their contents (useful when
+the folder is huge or the bundle exceeds Claude's context window). `--save` appends the Q&A to
+`~/Documents/ProjectTracking/ask-<project>.md` so you build up a project-specific history over time.
+
+The project argument is a substring match — `project-tracker ask abc "..."` matches both `abc-platform` (git repo) and
+`Abc Oy` (standalone documents folder). Git repos win when both match.
 
 ### Time estimation
 
