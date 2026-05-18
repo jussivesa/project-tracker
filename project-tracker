@@ -512,25 +512,27 @@ def summarize(text: str, prompt: str = "Summarize in 2-3 concise bullet points:"
         return ""
 
 _DOC_SUMMARY_PROMPT = """\
-Analyze the document below and respond in Markdown using exactly these sections.
-Omit a section only if it genuinely has no content (e.g. no attendees mentioned, no action points).
+Analyze the document below and respond in Markdown using exactly this flat
+structure — bold labels and bullet lists only, NO Markdown headings (no `#`,
+`##`, etc.). This block will be embedded under an H4 filename heading, so any
+heading you emit would break the document's hierarchy. Omit a block entirely
+if it has no content.
 
-## Summary
-One sentence: what this document is about.
+> One-sentence summary of what this document is about.
+
 **Attendees:** comma-separated names (omit line if none found)
 **Keywords:** 3-5 key topics, technologies, or proper nouns discussed
 
-## Key Points
-3-5 bullet points covering the most important information.
+**Key points:**
+- 3-5 bullets covering the most important information
 
-## Action Points
-Bullet list of concrete tasks or decisions that require follow-up.
-Write "None" if there are no action points.
+**Action points:**
+- concrete tasks or decisions that require follow-up
+- (write a single bullet "_None_" if there are no action points)
 
-## Suggested Next Steps
-0-3 specific, actionable suggestions for what I should do next based on this document.
-Examples of good suggestions: "Contact Matti regarding Azure DNS setup", "Implement customer filtering on the search form".
-Omit this section entirely if there is nothing actionable.
+**Next steps:**
+- 0-3 specific, actionable suggestions (e.g. "Contact Matti regarding Azure DNS setup")
+- (omit this entire block if there is nothing actionable)
 
 Document:
 """
@@ -766,9 +768,13 @@ def cmd_ask(args: argparse.Namespace) -> None:
     prompt = (
         f"You are answering a question about the project '{label}'. "
         "Use the context below to answer. If the context lacks enough "
-        "information, say so explicitly rather than guessing.\n\n"
-        f"# Question\n{question}\n\n"
-        f"# Context\n{context}"
+        "information, say so explicitly rather than guessing. "
+        "Format your answer in valid Markdown. Do NOT use H1 or H2 headings "
+        "(`#`, `##`) — your answer is embedded under an H2 entry, so start "
+        "any section headings at H3 (`###`) or below. Prefer bold labels and "
+        "bullet lists over headings when possible.\n\n"
+        f"## Question\n\n{question}\n\n"
+        f"## Context\n\n{context}"
     )
 
     print("Asking Claude…", file=sys.stderr)
@@ -776,18 +782,27 @@ def cmd_ask(args: argparse.Namespace) -> None:
     if not answer:
         sys.exit(1)
 
-    print(f"# {label} — {question}\n")
+    print(f"# Q&A — {label}\n")
+    print(f"**Question:** {question}\n")
     print(answer)
 
     if args.save:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         out = OUTPUT_DIR / f"ask-{label}.md"
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        entry = f"\n---\n\n## {ts}\n\n**Q:** {question}\n\n{answer}\n"
+        entry = "\n".join([
+            "",
+            f"## {ts}",
+            "",
+            f"**Question:** {question}",
+            "",
+            answer.rstrip(),
+            "",
+        ])
         if out.exists():
-            out.write_text(out.read_text() + entry)
+            out.write_text(out.read_text().rstrip() + "\n" + entry)
         else:
-            out.write_text(f"# Q&A history: {label}\n{entry}")
+            out.write_text(f"# Q&A — {label}\n" + entry)
         print(f"\nAppended → {out}", file=sys.stderr)
 
 # ─── Collection ───────────────────────────────────────────────────────────────
@@ -868,6 +883,24 @@ def collect_all(day: date, use_gh: bool = True,
     return sorted(results, key=lambda d: d.name)
 
 # ─── Formatting ───────────────────────────────────────────────────────────────
+#
+# Markdown template (consistent across day, week, and ask reports):
+#
+#   H1  Report title          (date, week range, "Q&A — <project>")
+#   H2  Top-level section     (project | "Projects" | "Day-by-day" | Q&A entry)
+#   H3  Subsection            (Commits | Pull requests | CI / Deployments |
+#                              Releases | Claude sessions | TODOs |
+#                              Meeting notes | weekday-within-week)
+#   H4  Nested detail         (a single meeting note file | a project under
+#                              a weekday in the week report)
+#
+# Rules:
+# - Never skip heading levels (no H2 → H4 jumps).
+# - Inside H4 we stay flat: **Bold label:** lines and bullet lists only;
+#   no further headings, no manually-indented sub-blocks.
+# - Every heading and every list is surrounded by blank lines.
+# - Inline pseudo-headings ("**Project** — …") are not used; if it would be
+#   a heading semantically, it is a real heading.
 
 _PREFIX_RE = re.compile(r"^(\w+)(?:\([^)]+\))?:\s*")
 
@@ -888,24 +921,36 @@ def _group_commits(commits: list[Commit]) -> str:
 
 _CI_ICON = {"success": "✓", "failure": "✗", "cancelled": "⊘", "skipped": "–"}
 
+def _inline(s: str) -> str:
+    """Collapse whitespace and strip leading Markdown heading markers so a
+    multi-line user prompt can be rendered as a single list-item bullet
+    without breaking the document's heading hierarchy."""
+    flat = " ".join((s or "").split())
+    return re.sub(r"(?:^|\s)#+\s+", " ", flat).strip()
+
 def _format_day_section(pd: ProjectDay, use_claude: bool) -> list[str]:
     lines: list[str] = []
-    lines.append(f"## {pd.name}  [~{pd.estimated_hours:.1f}h estimated]\n")
+    lines.append(f"## {pd.name}")
+    lines.append("")
+    lines.append(f"_Estimated time: ~{pd.estimated_hours:.1f}h_")
+    lines.append("")
 
     # Commits
     if pd.commits:
         ins = sum(c.insertions for c in pd.commits)
         dels = sum(c.deletions for c in pd.commits)
-        lines.append(f"### Commits ({len(pd.commits)})  +{ins}/−{dels} lines")
+        lines.append(f"### Commits ({len(pd.commits)}, +{ins}/−{dels})")
+        lines.append("")
         lines.append(_group_commits(pd.commits))
         lines.append("")
 
     # PRs
     if pd.prs:
-        lines.append("### PRs merged")
+        lines.append(f"### Pull requests ({len(pd.prs)})")
+        lines.append("")
         for pr in pd.prs:
-            lines.append(f"- #{pr.number}: {pr.title}")
-            lines.append(f"  {pr.url}")
+            url_suffix = f" — <{pr.url}>" if pr.url else ""
+            lines.append(f"- **#{pr.number}** {pr.title}{url_suffix}")
         lines.append("")
 
     # CI / Deployments
@@ -917,6 +962,7 @@ def _format_day_section(pd: ProjectDay, use_claude: bool) -> list[str]:
             if key not in seen_workflows:
                 seen_workflows[key] = r
         lines.append("### CI / Deployments")
+        lines.append("")
         for r in seen_workflows.values():
             icon = _CI_ICON.get(r.conclusion, "·")
             label = r.workflow or r.name
@@ -924,89 +970,98 @@ def _format_day_section(pd: ProjectDay, use_claude: bool) -> list[str]:
             if r.created_at:
                 local = r.created_at.astimezone()
                 time_str = f" at {local.strftime('%H:%M')}"
-            lines.append(f"- {icon} {label} ({r.branch}){time_str} — {r.conclusion or r.status}")
+            lines.append(f"- {icon} **{label}** ({r.branch}){time_str} — {r.conclusion or r.status}")
         lines.append("")
 
     # Releases
     if pd.releases:
-        lines.append("### Releases")
+        lines.append(f"### Releases ({len(pd.releases)})")
+        lines.append("")
         for rel in pd.releases:
-            lines.append(f"- **{rel.tag}**: {rel.name}")
+            lines.append(f"- **{rel.tag}** — {rel.name}")
         lines.append("")
 
     # Claude sessions — show a one-sentence summary per session when available;
     # fall back to the full first user message (never clipped).
     if pd.claude_sessions:
         lines.append(f"### Claude sessions ({len(pd.claude_sessions)})")
+        lines.append("")
         for s in pd.claude_sessions:
             if s.summary:
-                lines.append(f"- {s.summary}")
+                lines.append(f"- {_inline(s.summary)}")
             elif s.tasks:
-                lines.append(f"- {s.tasks[0]}")
+                lines.append(f"- {_inline(s.tasks[0])}")
             else:
                 lines.append("- _(no task captured)_")
         lines.append("")
 
-    # TODOs (code + conversation)
+    # TODOs (code + conversation) — flat bold-labels + bullets, no nested headings.
     code_td  = pd.todos
     conv_tds = [t for s in pd.claude_sessions for t in s.conv_todos]
     if code_td or conv_tds:
         lines.append("### TODOs")
+        lines.append("")
         if code_td:
             lines.append(f"**In code** ({len(code_td)} total, showing first 6):")
+            lines.append("")
             for t in code_td[:6]:
                 lines.append(f"- `{t.path}:{t.line}` {t.text[:100]}")
+            lines.append("")
         if conv_tds:
             lines.append("**In conversations:**")
+            lines.append("")
             for t in conv_tds[:4]:
                 lines.append(f"- {t}")
-        lines.append("")
+            lines.append("")
 
-    # Meeting notes
+    # Meeting notes — H4 per file, then flat summary block (no nested headings).
     if pd.meeting_notes:
-        lines.append("### Meeting notes")
+        lines.append(f"### Meeting notes ({len(pd.meeting_notes)})")
+        lines.append("")
         for note in pd.meeting_notes:
             lines.append(f"#### {note.name}")
+            lines.append("")
+            lines.append(f"`{note}`")
+            lines.append("")
             if use_claude:
-                content = _read_doc(note)
-                summary = summarize_document(content)
+                summary = summarize_document(_read_doc(note))
                 if summary:
-                    # Indent the structured markdown under the filename heading
-                    for summary_line in summary.splitlines():
-                        lines.append(f"  {summary_line}")
+                    lines.append(summary)
                 else:
-                    lines.append(f"  _(could not summarize — {note})_")
-            else:
-                lines.append(f"  `{note}`")
-        lines.append("")
+                    lines.append("_(could not summarize)_")
+                lines.append("")
 
     return lines
 
 def format_day(day: date, all_data: list[ProjectDay], use_claude: bool = True) -> str:
     active = [d for d in all_data if d.has_activity]
-    header = [f"# {day.strftime('%A, %Y-%m-%d')}\n"]
+    title = day.strftime("%Y-%m-%d (%A)")
 
     if not active:
-        return "".join(header) + "_No activity recorded._\n"
+        return f"# {title}\n\n_No activity recorded._\n"
 
     if use_claude:
         _populate_session_summaries([s for pd in active for s in pd.claude_sessions])
 
     total_h = sum(d.estimated_hours for d in active)
     proj_names = ", ".join(d.name for d in active)
-    header.append(f"**Estimated time**: ~{total_h:.1f}h — {proj_names}\n")
 
-    lines = list(header)
+    lines: list[str] = [
+        f"# {title}",
+        "",
+        f"_Estimated total: ~{total_h:.1f}h across {len(active)} project(s) — {proj_names}_",
+        "",
+    ]
     for pd in active:
         lines += _format_day_section(pd, use_claude)
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip() + "\n"
 
 def format_week(week_start: date, days_data: dict[date, list[ProjectDay]],
                 use_claude: bool = True) -> str:
     workdays = [week_start + timedelta(days=i) for i in range(5)]
     friday   = workdays[-1]
-    lines = [f"# Week {week_start.strftime('W%W')} — {week_start} → {friday}\n"]
+    title = f"Week {week_start.strftime('%G-W%V')} — {week_start} → {friday}"
 
     if use_claude:
         all_sessions = [
@@ -1031,56 +1086,81 @@ def format_week(week_start: date, days_data: dict[date, list[ProjectDay]],
             pt["releases"] += len(pd.releases)
 
     if not proj_totals:
-        lines.append("_No activity this week._\n")
-        return "\n".join(lines)
+        return f"# {title}\n\n_No activity this week._\n"
 
     total_h = sum(v["hours"] for v in proj_totals.values())
-    lines.append(f"**Total estimated time**: ~{total_h:.1f}h\n")
-    lines.append("## Projects\n")
+    lines: list[str] = [
+        f"# {title}",
+        "",
+        f"_Total estimated: ~{total_h:.1f}h_",
+        "",
+        "## Projects",
+        "",
+    ]
     for name, t in sorted(proj_totals.items(), key=lambda x: -x[1]["hours"]):
         parts = [f"~{t['hours']:.1f}h", f"{t['commits']} commits"]
         if t["prs"]:      parts.append(f"{t['prs']} PRs")
         if t["ci_runs"]:  parts.append(f"{t['ci_runs']} CI runs")
         if t["releases"]: parts.append(f"{t['releases']} releases")
-        lines.append(f"- **{name}**: {' · '.join(parts)}")
+        lines.append(f"- **{name}** — {' · '.join(parts)}")
     lines.append("")
 
-    # Day-by-day
-    lines.append("## Day-by-day\n")
+    # Day-by-day — H2 "Day-by-day", H3 per weekday, H4 per project under that day.
+    lines.append("## Day-by-day")
+    lines.append("")
     for day in workdays:
         day_data = days_data.get(day, [])
         active = [d for d in day_data if d.has_activity]
-        label = day.strftime("%a %d")
+        label = day.strftime("%A %Y-%m-%d")
         if not active:
-            lines.append(f"### {label}: _no activity_\n")
+            lines.append(f"### {label}")
+            lines.append("")
+            lines.append("_No activity._")
+            lines.append("")
             continue
         day_h = sum(d.estimated_hours for d in active)
         proj_list = ", ".join(d.name for d in active)
-        lines.append(f"### {label}: ~{day_h:.1f}h — {proj_list}\n")
+        lines.append(f"### {label}")
+        lines.append("")
+        lines.append(f"_~{day_h:.1f}h — {proj_list}_")
+        lines.append("")
         for pd in active:
-            header_parts = [f"**{pd.name}**"]
+            lines.append(f"#### {pd.name}")
+            lines.append("")
+            stats: list[str] = []
             if pd.commits:
                 ins = sum(c.insertions for c in pd.commits)
                 dels = sum(c.deletions for c in pd.commits)
-                header_parts.append(f"{len(pd.commits)} commits, +{ins}/−{dels}")
+                stats.append(f"{len(pd.commits)} commits (+{ins}/−{dels})")
+            if pd.prs:
+                stats.append(f"{len(pd.prs)} PRs merged")
+            if pd.releases:
+                stats.append(f"{len(pd.releases)} releases")
             if pd.claude_sessions:
-                header_parts.append(f"{len(pd.claude_sessions)} Claude session(s)")
-            lines.append(" — ".join(header_parts))
+                stats.append(f"{len(pd.claude_sessions)} Claude session(s)")
+            if stats:
+                lines.append(f"_{' · '.join(stats)}_")
+                lines.append("")
             if pd.commits:
                 lines.append(_group_commits(pd.commits))
+                lines.append("")
             if pd.prs:
-                lines.append("PRs: " + ", ".join(f"#{p.number}" for p in pd.prs))
+                lines.append("**PRs:** " + ", ".join(f"#{p.number}" for p in pd.prs))
+                lines.append("")
             if pd.releases:
-                lines.append("Releases: " + ", ".join(r.tag for r in pd.releases))
+                lines.append("**Releases:** " + ", ".join(r.tag for r in pd.releases))
+                lines.append("")
             if pd.claude_sessions and not pd.commits:
+                lines.append("**Claude sessions:**")
+                lines.append("")
                 for s in pd.claude_sessions:
                     if s.summary:
-                        lines.append(f"  - {s.summary}")
+                        lines.append(f"- {_inline(s.summary)}")
                     elif s.tasks:
-                        lines.append(f"  - {s.tasks[0]}")
-            lines.append("")
+                        lines.append(f"- {_inline(s.tasks[0])}")
+                lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip() + "\n"
 
 # ─── LaunchAgent setup ────────────────────────────────────────────────────────
 
