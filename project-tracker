@@ -116,6 +116,7 @@ class ClaudeSession:
     started_at: datetime
     tasks: list[str] = field(default_factory=list)    # first user messages
     conv_todos: list[str] = field(default_factory=list)
+    summary: str = ""                                 # one-sentence "what was this about", filled lazily
 
 @dataclass
 class TodoItem:
@@ -537,6 +538,33 @@ Document:
 def summarize_document(text: str) -> str:
     return summarize(text, _DOC_SUMMARY_PROMPT)
 
+_SESSION_SUMMARY_PROMPT = """\
+Below are the opening user messages from a Claude Code session.
+Reply with ONE concise sentence describing what the user was working on or trying to accomplish in this session.
+Do not include quotes, preamble, or a trailing period-only sentence — just the descriptive sentence itself.
+
+User messages:
+"""
+
+def summarize_claude_session(tasks: list[str]) -> str:
+    if not tasks:
+        return ""
+    text = "\n---\n".join(tasks)
+    return summarize(text, _SESSION_SUMMARY_PROMPT)
+
+def _populate_session_summaries(sessions: list[ClaudeSession]) -> None:
+    """Fill in `summary` for each session that has tasks, in parallel."""
+    pending = [s for s in sessions if s.tasks and not s.summary]
+    if not pending or not _claude_available():
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(summarize_claude_session, s.tasks): s for s in pending}
+        for fut in as_completed(futures):
+            try:
+                futures[fut].summary = fut.result()
+            except Exception:
+                pass
+
 # ─── Ask ──────────────────────────────────────────────────────────────────────
 
 _ASK_MAX_COMMITS     = 50
@@ -906,13 +934,17 @@ def _format_day_section(pd: ProjectDay, use_claude: bool) -> list[str]:
             lines.append(f"- **{rel.tag}**: {rel.name}")
         lines.append("")
 
-    # Claude sessions
+    # Claude sessions — show a one-sentence summary per session when available;
+    # fall back to the full first user message (never clipped).
     if pd.claude_sessions:
         lines.append(f"### Claude sessions ({len(pd.claude_sessions)})")
         for s in pd.claude_sessions:
-            for task in s.tasks[:2]:
-                short = task.splitlines()[0][:120]
-                lines.append(f"- {short}")
+            if s.summary:
+                lines.append(f"- {s.summary}")
+            elif s.tasks:
+                lines.append(f"- {s.tasks[0]}")
+            else:
+                lines.append("- _(no task captured)_")
         lines.append("")
 
     # TODOs (code + conversation)
@@ -957,6 +989,9 @@ def format_day(day: date, all_data: list[ProjectDay], use_claude: bool = True) -
     if not active:
         return "".join(header) + "_No activity recorded._\n"
 
+    if use_claude:
+        _populate_session_summaries([s for pd in active for s in pd.claude_sessions])
+
     total_h = sum(d.estimated_hours for d in active)
     proj_names = ", ".join(d.name for d in active)
     header.append(f"**Estimated time**: ~{total_h:.1f}h — {proj_names}\n")
@@ -967,10 +1002,18 @@ def format_day(day: date, all_data: list[ProjectDay], use_claude: bool = True) -
 
     return "\n".join(lines)
 
-def format_week(week_start: date, days_data: dict[date, list[ProjectDay]]) -> str:
+def format_week(week_start: date, days_data: dict[date, list[ProjectDay]],
+                use_claude: bool = True) -> str:
     workdays = [week_start + timedelta(days=i) for i in range(5)]
     friday   = workdays[-1]
     lines = [f"# Week {week_start.strftime('W%W')} — {week_start} → {friday}\n"]
+
+    if use_claude:
+        all_sessions = [
+            s for day in workdays for pd in days_data.get(day, [])
+            if pd.has_activity for s in pd.claude_sessions
+        ]
+        _populate_session_summaries(all_sessions)
 
     # Per-project totals
     proj_totals: dict[str, dict] = defaultdict(lambda: {
@@ -1031,8 +1074,10 @@ def format_week(week_start: date, days_data: dict[date, list[ProjectDay]]) -> st
                 lines.append("Releases: " + ", ".join(r.tag for r in pd.releases))
             if pd.claude_sessions and not pd.commits:
                 for s in pd.claude_sessions:
-                    if s.tasks:
-                        lines.append(f"  - {s.tasks[0].splitlines()[0][:100]}")
+                    if s.summary:
+                        lines.append(f"  - {s.summary}")
+                    elif s.tasks:
+                        lines.append(f"  - {s.tasks[0]}")
             lines.append("")
 
     return "\n".join(lines)
@@ -1335,7 +1380,7 @@ def main() -> None:
                 project_filter=args.project,
             )
 
-        report = format_week(week_start, days_data)
+        report = format_week(week_start, days_data, use_claude=not args.no_claude)
         print(report)
 
         if args.save:
