@@ -48,6 +48,26 @@ DOCUMENTS_DIR = _path("paths", "documents_dir", "~/Documents")
 CLAUDE_DIR    = _path("paths", "claude_dir",    "~/.claude/projects")
 OUTPUT_DIR    = _path("paths", "output_dir",    "~/Documents/ProjectTracking")
 
+def _resolved(p: Path) -> Path:
+    try:
+        return p.resolve()
+    except OSError:
+        return p.absolute()
+
+_OUTPUT_DIR_RESOLVED = _resolved(OUTPUT_DIR)
+
+def _is_under_output_dir(p: Path) -> bool:
+    """True if p is the output directory itself or anything inside it.
+    Prevents project-tracker from re-ingesting its own generated reports."""
+    rp = _resolved(p)
+    if rp == _OUTPUT_DIR_RESOLVED:
+        return True
+    try:
+        rp.relative_to(_OUTPUT_DIR_RESOLVED)
+        return True
+    except ValueError:
+        return False
+
 SESSION_GAP_H      = _int("estimation", "session_gap_hours",          2)
 SESSION_BASE_MIN   = _int("estimation", "session_base_minutes",       30)
 SESSION_PER_COMMIT = _int("estimation", "session_per_commit_minutes", 15)
@@ -426,7 +446,7 @@ def _find_docs_dir(proj: Path) -> Optional[Path]:
         return None
     best, best_score = None, 0
     for d in DOCUMENTS_DIR.iterdir():
-        if not d.is_dir():
+        if not d.is_dir() or _is_under_output_dir(d):
             continue
         score = _doc_score(proj.name, d.name)
         if score > best_score:
@@ -454,6 +474,8 @@ def meeting_notes_for_day(proj: Path, day: date) -> list[Path]:
     found = []
     for f in docs_dir.rglob("*"):
         if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+            continue
+        if _is_under_output_dir(f):
             continue
         try:
             mtime = f.stat().st_mtime
@@ -533,7 +555,7 @@ def _resolve_project(name: str) -> tuple[Optional[Path], Optional[Path]]:
             return p, _find_docs_dir(p)
     if DOCUMENTS_DIR.exists():
         for d in sorted(DOCUMENTS_DIR.iterdir()):
-            if d.is_dir() and nl in d.name.lower():
+            if d.is_dir() and not _is_under_output_dir(d) and nl in d.name.lower():
                 return None, d
     return None, None
 
@@ -567,6 +589,8 @@ def _recent_docs(docs_dir: Path, days: int) -> list[Path]:
     found = []
     for f in docs_dir.rglob("*"):
         if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+            continue
+        if _is_under_output_dir(f):
             continue
         try:
             if f.stat().st_mtime >= cutoff:
@@ -767,11 +791,13 @@ def collect_standalone_docs(day: date, claimed_dirs: set[Path]) -> list[ProjectD
     hi = datetime.combine(day, datetime.max.time()).timestamp()
     results = []
     for d in DOCUMENTS_DIR.iterdir():
-        if not d.is_dir() or d in claimed_dirs:
+        if not d.is_dir() or d in claimed_dirs or _is_under_output_dir(d):
             continue
         found = []
         for f in d.rglob("*"):
             if f.suffix.lower() not in {".txt", ".docx", ".md"}:
+                continue
+            if _is_under_output_dir(f):
                 continue
             try:
                 if lo <= f.stat().st_mtime <= hi:
